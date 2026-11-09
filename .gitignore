@@ -1,0 +1,52 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan-*
+crash.log
+.terraform.lock.hcl.bak
+backend.hcl
+
+
+# Каталог состояния локального backend'а (terraform.tfstate.d/) и файлы
+# блокировок, которые Terraform создаёт рядом с состоянием.
+terraform.tfstate.d/
+.terraform.tfstate.lock.info
+
+# Кэш плагинов tflint и кэш trivy: они скачиваются при первом запуске
+# и не должны попадать в репозиторий.
+.tflint.d/
+.trivy/
+trivy-cache/
+
+# Локальный конфиг CLI Terraform: в нём указываются зеркала провайдеров
+# и credentials — коммитить нельзя.
+.terraformrc
+terraform.rc
+
+# Lock-файлы коммитим только для root-модулей (envs). В переиспользуемом
+# модуле lock-файла нет: init выполняется в окружении, и версия провайдера
+# фиксируется lock-файлом окружения.
+Task1Advanced/modules/**/.terraform.lock.hcl
+
+# Локальное окружение с секретами
+.env
+
+# Переменные с секретами, которые Terraform читает автоматически, и локальные
+# override-файлы: их нельзя коммитить, они перекрывают код в репозитории.
+*.auto.tfvars
+*.auto.tfvars.json
+override.tf
+override.tf.json
+override_*.tf
+override_*.tf.json
+*_override.tf
+*_override.tf.json
+
+
+# Локальные артефакты редакторов и ОС
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db

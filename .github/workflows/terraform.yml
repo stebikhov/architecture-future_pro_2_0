@@ -1,0 +1,339 @@
+name: terraform
+
+on:
+  pull_request:
+    paths: ["Task1Advanced/**", "Task2Advanced/**", ".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: ["Task1Advanced/**", "Task2Advanced/**", ".github/workflows/**"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Окружение для развёртывания"
+        type: choice
+        options: [dev, stage, prod]
+        default: dev
+
+# Минимальные права по умолчанию: workflow только читает репозиторий.
+# Право на комментарий в PR выдаётся точечно job'у plan.
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # >= 1.10 — S3-native блокировка состояния (use_lockfile) и mock_provider
+  # для офлайн-тестов. Версия зафиксирована точно: обновление — осознанный шаг.
+  TF_VERSION: "1.17.1"
+  WORKDIR: Task2Advanced
+
+jobs:
+  setup:
+    # Определяет, какие окружения планировать:
+    # - PR/push: все три (dev, stage, prod);
+    # - ручной запуск: только выбранное окружение.
+    # Без этого ручной apply dev тянул бы за собой план остальных окружений
+    # (и их approval).
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.matrix.outputs.envs }}
+    steps:
+      - id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            printf 'envs=["%s"]\n' "$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          else
+            echo 'envs=["dev","stage","prod"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    # Без секретов и без доступа к backend.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - run: terraform fmt -check -recursive
+      # -lockfile=readonly: CI применяет ровно ту версию провайдера, что закоммичена.
+      - run: terraform init -backend=false -lockfile=readonly
+      - run: terraform validate
+      - name: Офлайн-тест конфигурации (mock_provider)
+        run: terraform test -no-color
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint
+        run: tflint --init --config=${{ github.workspace }}/Task2Advanced/.tflint.hcl && tflint --config=${{ github.workspace }}/Task2Advanced/.tflint.hcl
+      - name: trivy (конфигурация IaC)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ env.WORKDIR }}
+          # Находки HIGH/CRITICAL блокируют конвейер: разбор и исключения
+          # фиксируются в trivyignores, а не отключением проверки.
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+
+  validate-task1:
+    # Task1Advanced: форматирование, валидация и офлайн-тесты каждого окружения.
+    # Секреты и доступ в облако не нужны: тесты работают через mock_provider.
+    name: "Task1: fmt, validate, test"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ["dev", "stage", "prod"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Форматирование
+        run: terraform fmt -check -recursive
+        working-directory: Task1Advanced
+      - name: Инициализация
+        run: terraform init -backend=false -lockfile=readonly
+        working-directory: Task1Advanced/envs/${{ matrix.environment }}
+      - name: Валидация
+        run: terraform validate
+        working-directory: Task1Advanced/envs/${{ matrix.environment }}
+      - name: Офлайн-тест окружения
+        run: terraform test -var-file=${{ matrix.environment }}.tfvars
+        working-directory: Task1Advanced/envs/${{ matrix.environment }}
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint
+        run: tflint --init --config=${{ github.workspace }}/.tflint.hcl && tflint --config=${{ github.workspace }}/.tflint.hcl
+        working-directory: Task1Advanced/envs/${{ matrix.environment }}
+      - name: trivy (конфигурация IaC)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: Task1Advanced
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+
+  test-module:
+    # Task1Advanced: юнит-тесты переиспользуемого модуля vm (mock_provider, без облака).
+    name: "Task1: тесты модуля vm"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Инициализация модуля
+        # У модуля нет lock-файла (init выполняется в окружении, версия
+        # провайдера фиксируется lock-файлом окружения), поэтому readonly здесь
+        # неприменим.
+        run: terraform init -backend=false
+        working-directory: Task1Advanced/modules/vm
+      - name: Тесты модуля
+        run: terraform test
+        working-directory: Task1Advanced/modules/vm
+
+  plan:
+    needs: [validate, setup]
+    # Fork-PR не получают секреты Environment; пропускаем план, чтобы не было красного job.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Нужно для публикации сводки плана комментарием в PR.
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # PR/push — все окружения; ручной запуск — только выбранное (см. job setup).
+        environment: ${{ fromJSON(needs.setup.outputs.envs) }}
+    # Планирование идёт в окружении plan-<env> с read-only ключом к состоянию
+    # и без Required reviewers; авторитетный план для apply (ручной запуск) —
+    # в окружении <env> с полными правами, refresh и блокировкой.
+    # Правила защиты окружения привязаны к job'у, поэтому без разделения
+    # PR-план для stage/prod ждал бы ручного согласования, хотя ничего не
+    # применяет, а push в main оставлял бы запуски в состоянии «ожидает».
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && matrix.environment || format('plan-{0}', matrix.environment) }}
+    concurrency:
+      group: tf-${{ matrix.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      # Несекретные параметры: идентификаторы облака и адреса backend'а.
+      # Секреты намеренно не объявлены на уровне job — они выдаются только
+      # конкретным шагам, чтобы сторонние actions их не видели.
+      TF_VAR_cloud_id: ${{ vars.YC_CLOUD_ID }}
+      TF_VAR_folder_id: ${{ vars.YC_FOLDER_ID }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_ENDPOINT: ${{ vars.TF_STATE_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: backend config
+        # Отдельный скрипт, а не heredoc в YAML: отступы блока run: | ломали
+        # закрывающий EOF. Подробности — в Task2Advanced/scripts/gen-backend-config.sh.
+        run: bash scripts/gen-backend-config.sh "${{ matrix.environment }}"
+      - name: terraform init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: terraform init -lockfile=readonly -backend-config=backend.hcl
+      - name: terraform plan
+        id: plan
+        # continue-on-error нужен, чтобы успеть опубликовать сводку плана в PR;
+        # отдельный шаг ниже валит job, если plan завершился ошибкой.
+        continue-on-error: true
+        shell: bash
+        env:
+          # Ключи Object Storage нужны провайдеру Yandex Cloud, IAM-токен — для
+          # чтения/создания ресурсов. В окружении plan-<env> это read-only
+          # учётные данные, в окружении <env> — с правом записи.
+          YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: |
+          set -o pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Ручной запуск: авторитетный план для apply — с refresh и блокировкой
+            # состояния, полный текст попадает в лог job'а.
+            terraform plan -no-color -lock-timeout=5m \
+              -var-file=envs/${{ matrix.environment }}.tfvars \
+              -out=tfplan-${{ matrix.environment }} 2>&1 | tee plan.txt
+          else
+            # PR и push: план считается без обращения к облаку (refresh выключен)
+            # и без блокировки состояния (ключ только на чтение). Полный текст
+            # плана не попадает ни в лог, ни в комментарий — наружу уходит сводка.
+            if ! terraform plan -no-color -refresh=false -lock=false \
+              -var-file=envs/${{ matrix.environment }}.tfvars \
+              -out=tfplan-${{ matrix.environment }} > plan.txt 2>&1; then
+              grep -E "Error" plan.txt | head -40 || true
+              exit 1
+            fi
+          fi
+      - name: Сводка плана
+        # В сводку попадают только адреса ресурсов и действия: значения ресурсов
+        # (ID сетей, имена бакетов) в публичный репозиторий не выгружаются.
+        if: always() && steps.plan.outcome != 'failure'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          terraform show -json "tfplan-${{ matrix.environment }}" > plan.json
+          {
+            echo "Окружение: ${{ matrix.environment }}"
+            echo
+            echo "| Действие | Ресурс |"
+            echo "|---|---|"
+            jq -r '.resource_changes[] | select(.change.actions != ["no-op"]) | "| " + (.change.actions | join(",")) + " | " + .address + " |"' plan.json
+            echo
+            echo "Всего изменений: $(jq '[.resource_changes[] | select(.change.actions != ["no-op"])] | length' plan.json)"
+          } > plan-summary.md
+          cat plan-summary.md
+      - name: Комментарий со сводкой плана в PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          ENV_NAME: ${{ matrix.environment }}
+          SUMMARY_FILE: ${{ env.WORKDIR }}/plan-summary.md
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- terraform-plan:${process.env.ENV_NAME} -->`;
+            const file = process.env.SUMMARY_FILE;
+            let summary = fs.existsSync(file)
+              ? fs.readFileSync(file, 'utf8').trim()
+              : '_План не сформирован: шаг terraform plan завершился ошибкой._';
+            const limit = 60000;
+            if (summary.length > limit) {
+              summary = summary.slice(0, limit) + '\n... (сводка обрезана)';
+            }
+            const body = `${marker}\n### Terraform plan — \`${process.env.ENV_NAME}\`\n\n${summary}\n\n_Публикуется сводка (ресурсы и действия). Полный план — в логе job'а; значения ресурсов не раскрываются._`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+      - name: Провалить job, если plan завершился ошибкой
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+      - name: Сохранение сводки плана
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-summary-${{ matrix.environment }}
+          path: ${{ env.WORKDIR }}/plan-summary.md
+          retention-days: 1
+      - name: Сохранение бинарного плана (для apply)
+        # Бинарный план нужен только apply; в PR он не выгружается — он содержит
+        # значения переменных и попал бы в публичный репозиторий.
+        if: steps.plan.outcome == 'success' && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: |
+            ${{ env.WORKDIR }}/tfplan-${{ matrix.environment }}
+            ${{ env.WORKDIR }}/plan.txt
+          retention-days: 1
+
+  apply:
+    # Только ручной запуск (workflow_dispatch). Approval-шаг: Required reviewers
+    # в настройках GitHub Environment (обязательно для stage и prod).
+    if: github.event_name == 'workflow_dispatch'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: tf-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      # Несекретные параметры; секреты — на уровне шагов.
+      TF_VAR_cloud_id: ${{ vars.YC_CLOUD_ID }}
+      TF_VAR_folder_id: ${{ vars.YC_FOLDER_ID }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_ENDPOINT: ${{ vars.TF_STATE_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.WORKDIR }}
+      - name: Проверка форматирования
+        # Формальная защита: даже если план пришёл из другой ветки, код должен быть отформатирован.
+        run: terraform fmt -check -recursive
+      - name: backend config
+        run: bash scripts/gen-backend-config.sh "${{ inputs.environment }}"
+      - name: terraform init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: terraform init -lockfile=readonly -backend-config=backend.hcl
+      - name: terraform apply (по сохранённому плану)
+        env:
+          YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: terraform apply -auto-approve -lock-timeout=5m tfplan-${{ inputs.environment }}
