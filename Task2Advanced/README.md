@@ -31,6 +31,7 @@ CI лежит в `.github/workflows/`, а не в `Task2Advanced/`: GitHub Actio
 | `.terraform.lock.hcl`                        | Фиксация версии провайдера `yandex-cloud/yandex` 0.243.0                                                                                                      |
 | `.tflint.hcl`                                | Правила TFLint для Task2 (рекомендованный пресет + документирование и структура модуля)                                                                       |
 | `scripts/gen-backend-config.sh`              | Генерация `backend.hcl` из переменных окружения (вызывается из конвейера CI)                                                                                  |
+| `scripts/check-ci-config.sh`                 | Проверка конфигурации CI: список незаданных переменных и секретов — в stderr и (с `--message-file`) в файл для комментария в PR                   |
 | `tests/plan.tftest.hcl`                      | Офлайн-план с `mock_provider`: проверяет CIDR, приватность и версионирование бакета, имя сети                                                                 |
 | `../.github/workflows/terraform.yml`         | Pipeline (лежит в корне репозитория — GitHub читает workflows только оттуда)                                                                                  |
 | `../.github/workflows/terraform-destroy.yml` | Ручное удаление окружения с подтверждением                                                                                                                    |
@@ -106,6 +107,17 @@ create`, `mc mb` для MinIO или `aws s3api create-bucket`). Обязате�
 (`dev/terraform.tfstate` и т. д.) изолирует состояния; блокировка через lock-файл не допускает
 параллельных apply. Бакет состояния создаётся заранее вручную (bootstrap, см. выше).
 
+**Формат ключа для S3-API.** В `AWS_ACCESS_KEY_ID` для Yandex Object Storage подставляется **key_id**
+статического ключа (`YCAJ...`), а не 20-символьный `id` из `yc iam access-key list`. С `id` запрос
+подписывается неверно и Object Storage отвечает `SignatureDoesNotMatch` даже при верном секрете:
+
+```bash
+yc iam access-key create --service-account-id <sa-id> --format json
+# -> access_key.id      (ajem0kh3f8smsuf9ihdd) - это НЕ ключ для S3
+# -> access_key.key_id  (YCAJE7p1Cf5KubfQLwdjaCyDr) - это ключ для S3
+# -> secret             (YCOSWpPyWpJDoXGee-...)
+```
+
 ## Pipeline (GitHub Actions)
 
 1. `setup` — вычисляет matrix для `plan`: на PR/push — все три окружения, на ручном запуске — только
@@ -115,7 +127,13 @@ create`, `mc mb` для MinIO или `aws s3api create-bucket`). Обязате�
    без секретов и без доступа к backend.
 3. `validate-task1` и `test-module` — то же самое для Task1: форматирование, валидация и офлайн-тесты
    окружений `dev`/`stage`/`prod` и переиспользуемого модуля `vm`. Секреты не нужны.
-4. `plan` — `init` с backend → `plan -var-file=envs/<env>.tfvars -out`.
+4. `plan` — сначала `preflight` (проверка конфигурации CI), затем `init` с backend →
+   `plan -var-file=envs/<env>.tfvars -out`.
+   - аутентификация провайдера: ровно один способ — ключ сервисного аккаунта
+     (`YC_SA_KEY_FILE` → `YC_SERVICE_ACCOUNT_KEY_FILE`, срок не ограничен) либо IAM-токен
+     (`YC_TOKEN`, до 12 часов). Одновременно их задавать нельзя: в провайдере `token` и
+     `service_account_key_file` конфликтуют (`ConflictsWith`), поэтому шаг выбирает один и
+     прокидывает провайдеру только его;
    - pull request: план для `dev`, `stage` и `prod` считается без обращения к облаку
      (`-refresh=false`) и без блокировки (`-lock=false`) — учётные данные окружения `plan-<env>`
      дают только чтение состояния; из форков план пропускается (нет доступа к секретам);
@@ -126,6 +144,12 @@ create`, `mc mb` для MinIO или `aws s3api create-bucket`). Обязате�
      отдельный комментарий на окружение, иначе matrix-job'ы перезаписывали бы один и тот же
      комментарий): адреса ресурсов и действия (`create`/`update`/`delete`/`replace`) плюс их
      количество. Значения ресурсов не публикуются. Полный план остаётся в логе job'а.
+   - `preflight` (`scripts/check-ci-config.sh`) проверяет переменные и секреты окружения **до**
+     обращения к облаку. Если CI не настроен, на PR и push план не считается, а в комментарии
+     публикуется точный список незаданных параметров; на ручном запуске job падает с тем же
+     списком — пропустить авторитетный план молча нельзя, иначе `apply` применил бы несуществующий
+     план. Без этой проверки ошибка выглядела бы как сбой Terraform (`TF_STATE_BUCKET обязателен`),
+     хотя на самом деле репозиторий просто не настроен.
 5. `apply` — только вручную (`workflow_dispatch`, выбор окружения: `dev`, `stage` или `prod`).
    Применяется именно сохранённый план (`apply tfplan`), что исключает дрейф между просмотром и
    применением. В начале job повторно выполняется `terraform fmt -check -recursive`: если план
@@ -185,10 +209,13 @@ create`, `mc mb` для MinIO или `aws s3api create-bucket`). Обязате�
 - блок `env` повторяется в jobs `plan`, `apply` и `destroy`; при росте числа окружений его можно вынести
   в переиспользуемый workflow (reusable workflow);
 - **`plan` на PR выполняется в окружении `plan-<env>` с read-only учётными данными.** Провайдер
-  Yandex Cloud проверяет IAM-токен уже на этапе конфигурации, поэтому `YC_TOKEN` в `plan-<env>` должен
-  быть валидным (роль Viewer). Права на запись у него нет;
-- `YC_TOKEN` — короткоживущий IAM-токен. Для длинных approval-пауз надёжнее сервисный аккаунт через
-  `YC_SERVICE_ACCOUNT_KEY_FILE` или OIDC-федерация удостоверений рабочих нагрузок, а не ручной `yc iam create-token`;
+  Yandex Cloud проверяет учётные данные уже на этапе конфигурации, поэтому `YC_SA_KEY_FILE`
+  (ключ сервисного аккаунта) или `YC_TOKEN` в `plan-<env>` должен быть валидным (роль Viewer).
+  Права на запись у него нет;
+- `YC_TOKEN` — короткоживущий IAM-токен (до 12 часов): для длинных approval-пауз и бесперебойных
+  запусков нужен `YC_SA_KEY_FILE` (ключ сервисного аккаунта) или OIDC-федерация удостоверений
+  рабочих нагрузок, а не ручной `yc iam create-token`. Задать оба способа сразу нельзя: в
+  провайдере `token` и `service_account_key_file` конфликтуют;
 - ограничьте **Deployment branches** в настройках каждого GitHub Environment (например, только `main`),
   иначе `workflow_dispatch` с произвольной ветки сможет получить секреты окружения и применить код из неё;
 - стартовое наполнение (бакет состояния) сейчас выполняется вручную; его можно оформить
@@ -203,12 +230,48 @@ create`, `mc mb` для MinIO или `aws s3api create-bucket`). Обязате�
 ## Что настроить перед запуском
 
 Secrets (для каждого Environment: `dev`, `stage`, `prod`):
-`S3_ACCESS_KEY`, `S3_SECRET_KEY`, `YC_TOKEN`.
-Variables: `YC_CLOUD_ID`, `YC_FOLDER_ID`, `TF_STATE_BUCKET`, `TF_STATE_ENDPOINT`.
+`S3_ACCESS_KEY`, `S3_SECRET_KEY` и один из двух способов аутентификации провайдера —
+`YC_SA_KEY_FILE` (ключ сервисного аккаунта, рекомендуется: срок не ограничен) или `YC_TOKEN`
+(IAM-токен, до 12 часов). Variables: `YC_CLOUD_ID`, `YC_FOLDER_ID`, `TF_STATE_BUCKET`,
+`TF_STATE_ENDPOINT`.
+
+Ключ сервисного аккаунта для CI:
+
+```bash
+yc iam service-account create --name tfstate-ci --folder-id <folder-id>
+yc iam key create --service-account-id <sa-id> -o sa-key.json   # содержимое -> YC_SA_KEY_FILE
+yc iam access-key create --service-account-id <sa-id> --format json  # key_id -> S3_ACCESS_KEY
+```
+
+Сервисному аккаунту нужны роли на каталоге: `storage.admin` (состояние и создание бакета данных)
+и `vpc.admin` (сеть и подсеть окружения).
+
+```bash
+yc resource-manager folder add-access-binding <folder-id> --role storage.admin --subject serviceAccount:<sa-id>
+yc resource-manager folder add-access-binding <folder-id> --role vpc.admin --subject serviceAccount:<sa-id>
+```
 
 Отдельно создайте Environments `plan-dev`, `plan-stage`, `plan-prod` с теми же именами секретов:
-`S3_ACCESS_KEY`/`S3_SECRET_KEY` — ключ только на чтение бакета состояния, `YC_TOKEN` — IAM-токен с
-ролью Viewer; variables те же. Без них план на pull request не сможет прочитать состояние.
+`S3_ACCESS_KEY`/`S3_SECRET_KEY` — ключ только на чтение бакета состояния, `YC_SA_KEY_FILE` — ключ
+сервисного аккаунта с ролью Viewer; variables те же. Без них план на pull request не сможет прочитать
+состояние.
+
+Пока это не сделано, job `plan` на PR и push не считает план (комментарий в PR перечисляет
+незаданные параметры), а ручной запуск и `terraform-destroy` падают с тем же списком. Проверка
+выполняется скриптом `scripts/check-ci-config.sh` до обращения к облаку; список требуемых
+параметров можно получить и локально:
+
+```bash
+export TF_VAR_cloud_id=... TF_VAR_folder_id=...
+export TF_STATE_BUCKET=... TF_STATE_ENDPOINT=...
+export S3_ACCESS_KEY=... S3_SECRET_KEY=...
+export YC_SERVICE_ACCOUNT_KEY_FILE=./sa-key.json   # или YC_TOKEN=...
+bash scripts/check-ci-config.sh --environment plan-dev
+```
+
+Скрипт завершится с кодом 0, если всё задано, и с кодом 1 (список недостающих — в stderr), если нет.
+`--message-file <файл>` дополнительно записывает готовое пояснение на русском — именно его
+публикует job `plan` в PR.
 
 Для `stage` и `prod` включите **Required reviewers** в настройках Environment — это и есть этап
 approval перед `apply` и `destroy`.

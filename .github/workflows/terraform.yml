@@ -179,11 +179,64 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+      - name: Аутентификация провайдера
+        # Ровно один способ аутентификации: ключ сервисного аккаунта (срок не
+        # ограничен) либо IAM-токен (до 12 часов). Одновременно задавать их
+        # нельзя: в провайдере token и service_account_key_file конфликтуют.
+        # Ключ кладётся в файл, в окружение попадает только путь к нему.
+        shell: bash
+        env:
+          SA_KEY: ${{ secrets.YC_SA_KEY_FILE }}
+          IAM_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: |
+          if [ -n "$SA_KEY" ]; then
+            printf '%s' "$SA_KEY" > sa-key.json
+            chmod 600 sa-key.json
+            echo "YC_SERVICE_ACCOUNT_KEY_FILE=$PWD/sa-key.json" >> "$GITHUB_ENV"
+            echo "Аутентификация провайдера: ключ сервисного аккаунта"
+          elif [ -n "$IAM_TOKEN" ]; then
+            echo "YC_TOKEN=$IAM_TOKEN" >> "$GITHUB_ENV"
+            echo "Аутентификация провайдера: IAM-токен (короткоживущий)"
+          else
+            echo "::error::Не задан ни YC_SA_KEY_FILE, ни YC_TOKEN"
+            exit 1
+          fi
+      - name: Проверка конфигурации CI
+        id: preflight
+        # Проверка идёт до обращения к облаку: без переменных окружения и
+        # секретов план посчитал бы несуществующее окружение, и ошибка выглядела
+        # бы как сбой Terraform, а не как незаполненная конфигурация репозитория.
+        shell: bash
+        env:
+          CI_ENVIRONMENT: ${{ github.event_name == 'workflow_dispatch' && matrix.environment || format('plan-{0}', matrix.environment) }}
+          TF_VAR_cloud_id: ${{ vars.YC_CLOUD_ID }}
+          TF_VAR_folder_id: ${{ vars.YC_FOLDER_ID }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_ENDPOINT: ${{ vars.TF_STATE_ENDPOINT }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: |
+          if bash scripts/check-ci-config.sh --environment "$CI_ENVIRONMENT" --message-file plan-error.txt; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::warning::CI не настроен: не заданы обязательные параметры (список — в plan-error.txt)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Ручной запуск обязан посчитать авторитетный план: «тихо» пропустить
+            # его нельзя, иначе apply применил бы несуществующий план.
+            echo "::error::Ручной запуск требует полной конфигурации CI"
+            exit 1
+          fi
+          # PR и push: инфраструктура ещё не развёрнута — план не считаем,
+          # но публикуем в PR точный список того, что нужно задать.
+          echo "configured=false" >> "$GITHUB_OUTPUT"
       - name: backend config
         # Отдельный скрипт, а не heredoc в YAML: отступы блока run: | ломали
         # закрывающий EOF. Подробности — в Task2Advanced/scripts/gen-backend-config.sh.
+        if: steps.preflight.outputs.configured == 'true'
         run: bash scripts/gen-backend-config.sh "${{ matrix.environment }}"
       - name: terraform init
+        if: steps.preflight.outputs.configured == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
@@ -192,15 +245,17 @@ jobs:
         id: plan
         # continue-on-error нужен, чтобы успеть опубликовать сводку плана в PR;
         # отдельный шаг ниже валит job, если plan завершился ошибкой.
+        if: steps.preflight.outputs.configured == 'true'
         continue-on-error: true
         shell: bash
         env:
-          # Ключи Object Storage нужны провайдеру Yandex Cloud, IAM-токен — для
-          # чтения/создания ресурсов. В окружении plan-<env> это read-only
-          # учётные данные, в окружении <env> — с правом записи.
+          # Ключи Object Storage нужны провайдеру Yandex Cloud для создания
+          # бакета. Учётные данные провайдера (YC_TOKEN или
+          # YC_SERVICE_ACCOUNT_KEY_FILE) прокинуты предыдущим шагом через
+          # GITHUB_ENV: задавать их здесь нельзя — провайдер запрещает
+          # комбинацию token и service_account_key_file.
           YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
         run: |
@@ -225,7 +280,9 @@ jobs:
       - name: Сводка плана
         # В сводку попадают только адреса ресурсов и действия: значения ресурсов
         # (ID сетей, имена бакетов) в публичный репозиторий не выгружаются.
-        if: always() && steps.plan.outcome != 'failure'
+        # Файл создаётся только при успешном плане: иначе комментарий взял бы
+        # пустую сводку вместо описания причины сбоя.
+        if: always() && steps.preflight.outputs.configured == 'true' && steps.plan.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -247,14 +304,23 @@ jobs:
         env:
           ENV_NAME: ${{ matrix.environment }}
           SUMMARY_FILE: ${{ env.WORKDIR }}/plan-summary.md
+          ERROR_FILE: ${{ env.WORKDIR }}/plan-error.txt
         with:
           script: |
             const fs = require('fs');
             const marker = `<!-- terraform-plan:${process.env.ENV_NAME} -->`;
-            const file = process.env.SUMMARY_FILE;
-            let summary = fs.existsSync(file)
-              ? fs.readFileSync(file, 'utf8').trim()
-              : '_План не сформирован: шаг terraform plan завершился ошибкой._';
+            const summaryFile = process.env.SUMMARY_FILE;
+            const errorFile = process.env.ERROR_FILE;
+            // Приоритет у сводки плана; если плана нет — текст причины
+            // (например, незаполненная конфигурация CI) из шага preflight.
+            let summary;
+            if (fs.existsSync(summaryFile) && fs.readFileSync(summaryFile, 'utf8').trim()) {
+              summary = fs.readFileSync(summaryFile, 'utf8').trim();
+            } else if (fs.existsSync(errorFile)) {
+              summary = fs.readFileSync(errorFile, 'utf8').trim();
+            } else {
+              summary = '_План не сформирован: шаг terraform plan завершился ошибкой. Подробности — в логе job\'а._';
+            }
             const limit = 60000;
             if (summary.length > limit) {
               summary = summary.slice(0, limit) + '\n... (сводка обрезана)';
@@ -317,6 +383,41 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+      - name: Аутентификация провайдера
+        # Как в job plan: ровно один способ аутентификации — ключ сервисного
+        # аккаунта или IAM-токен.
+        shell: bash
+        env:
+          SA_KEY: ${{ secrets.YC_SA_KEY_FILE }}
+          IAM_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: |
+          if [ -n "$SA_KEY" ]; then
+            printf '%s' "$SA_KEY" > sa-key.json
+            chmod 600 sa-key.json
+            echo "YC_SERVICE_ACCOUNT_KEY_FILE=$PWD/sa-key.json" >> "$GITHUB_ENV"
+          elif [ -n "$IAM_TOKEN" ]; then
+            echo "YC_TOKEN=$IAM_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo "::error::Не задан ни YC_SA_KEY_FILE, ни YC_TOKEN"
+            exit 1
+          fi
+      - name: Проверка конфигурации CI
+        # apply не может быть «пропущен»: без полной конфигурации job обязан
+        # упасть с перечнем недостающих параметров, а не с ошибкой backend'а.
+        shell: bash
+        env:
+          CI_ENVIRONMENT: ${{ inputs.environment }}
+          TF_VAR_cloud_id: ${{ vars.YC_CLOUD_ID }}
+          TF_VAR_folder_id: ${{ vars.YC_FOLDER_ID }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_ENDPOINT: ${{ vars.TF_STATE_ENDPOINT }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: |
+          if ! bash scripts/check-ci-config.sh --environment "$CI_ENVIRONMENT"; then
+            echo "::error::Не заданы обязательные параметры CI (Environment $CI_ENVIRONMENT)"
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: tfplan-${{ inputs.environment }}
@@ -335,5 +436,4 @@ jobs:
         env:
           YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
         run: terraform apply -auto-approve -lock-timeout=5m tfplan-${{ inputs.environment }}

@@ -7,6 +7,17 @@ crash.log
 .terraform.lock.hcl.bak
 backend.hcl
 
+# Артефакты конвейера: текст плана, JSON-план, сводка и пояснение о
+# незаполненной конфигурации CI.
+plan.txt
+plan.json
+plan-summary.md
+plan-error.txt
+
+# Ключ сервисного аккаунта, который конвейер кладёт в рабочий каталог для
+# аутентификации провайдера (YC_SERVICE_ACCOUNT_KEY_FILE).
+sa-key.json
+
 
 # Каталог состояния локального backend'а (terraform.tfstate.d/) и файлы
 # блокировок, которые Terraform создаёт рядом с состоянием.
