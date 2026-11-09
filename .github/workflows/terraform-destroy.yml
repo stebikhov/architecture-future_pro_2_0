@@ -109,9 +109,17 @@ jobs:
         env:
           YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          # Ключи нужны самому S3-backend'у: он обращается к состоянию при
+          # каждом запуске, в том числе при plan -destroy.
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
         run: terraform plan -destroy -no-color -lock-timeout=5m -var-file=envs/${{ inputs.environment }}.tfvars -out=destroy.tfplan
       - name: terraform destroy (по сохранённому плану)
         env:
           YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          # Ключи нужны самому S3-backend'у: он обращается к состоянию при
+          # каждом запуске, в том числе при apply по сохранённому плану.
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
         run: terraform apply -auto-approve -lock-timeout=5m destroy.tfplan
