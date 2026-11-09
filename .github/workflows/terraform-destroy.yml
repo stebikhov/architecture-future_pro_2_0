@@ -1,0 +1,125 @@
+name: terraform-destroy
+
+# Ручное удаление инфраструктуры окружения.
+# Защита от случайного запуска: нужно ввести подтверждение destroy-<env>,
+# плюс действует approval (Required reviewers) GitHub Environment.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Окружение, ресурсы которого удаляются"
+        type: choice
+        options: [dev, stage, prod]
+        default: dev
+      confirm:
+        description: "Введите destroy-<environment> для подтверждения"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VERSION: "1.17.1"
+  WORKDIR: Task2Advanced
+
+jobs:
+  check:
+    # Подтверждение проверяется в отдельном job, чтобы несовпадение было явной ошибкой,
+    # а не «молча пропущенным» запуском. Значения передаются через env, не в скрипт.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверка подтверждения
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ "$CONFIRM" != "destroy-$ENVIRONMENT" ]; then
+            echo "::error::Для удаления введите confirm = destroy-$ENVIRONMENT"
+            exit 1
+          fi
+
+  destroy:
+    needs: check
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: tf-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      # Несекретные параметры; секреты — на уровне шагов.
+      TF_VAR_cloud_id: ${{ vars.YC_CLOUD_ID }}
+      TF_VAR_folder_id: ${{ vars.YC_FOLDER_ID }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_ENDPOINT: ${{ vars.TF_STATE_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Аутентификация провайдера
+        # Ровно один способ аутентификации: ключ сервисного аккаунта (срок не
+        # ограничен) либо IAM-токен (до 12 часов). Одновременно задавать их
+        # нельзя: в провайдере token и service_account_key_file конфликтуют.
+        shell: bash
+        env:
+          SA_KEY: ${{ secrets.YC_SA_KEY_FILE }}
+          IAM_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: |
+          if [ -n "$SA_KEY" ]; then
+            printf '%s' "$SA_KEY" > sa-key.json
+            chmod 600 sa-key.json
+            echo "YC_SERVICE_ACCOUNT_KEY_FILE=$PWD/sa-key.json" >> "$GITHUB_ENV"
+          elif [ -n "$IAM_TOKEN" ]; then
+            echo "YC_TOKEN=$IAM_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo "::error::Не задан ни YC_SA_KEY_FILE, ни YC_TOKEN"
+            exit 1
+          fi
+      - name: Проверка конфигурации CI
+        # Удаление инфраструктуры требует полного набора параметров: без них
+        # job обязан упасть с перечнем недостающих, а не с ошибкой backend'а.
+        shell: bash
+        env:
+          CI_ENVIRONMENT: ${{ inputs.environment }}
+          TF_VAR_cloud_id: ${{ vars.YC_CLOUD_ID }}
+          TF_VAR_folder_id: ${{ vars.YC_FOLDER_ID }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_ENDPOINT: ${{ vars.TF_STATE_ENDPOINT }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: |
+          if ! bash scripts/check-ci-config.sh --environment "$CI_ENVIRONMENT"; then
+            echo "::error::Не заданы обязательные параметры CI (Environment $CI_ENVIRONMENT)"
+            exit 1
+          fi
+      - name: backend config
+        run: bash scripts/gen-backend-config.sh "${{ inputs.environment }}"
+      - name: terraform init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: terraform init -lockfile=readonly -backend-config=backend.hcl
+      - name: Показать, что будет удалено
+        env:
+          YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          # Ключи нужны самому S3-backend'у: он обращается к состоянию при
+          # каждом запуске, в том числе при plan -destroy.
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: terraform plan -destroy -no-color -lock-timeout=5m -var-file=envs/${{ inputs.environment }}.tfvars -out=destroy.tfplan
+      - name: terraform destroy (по сохранённому плану)
+        env:
+          YC_STORAGE_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          YC_STORAGE_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          # Ключи нужны самому S3-backend'у: он обращается к состоянию при
+          # каждом запуске, в том числе при apply по сохранённому плану.
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: terraform apply -auto-approve -lock-timeout=5m destroy.tfplan
